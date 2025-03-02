@@ -5,11 +5,16 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"maps"
 	"math/rand/v2"
+	pt "mux/internal/packet"
 	"mux/internal/utils"
 	"net"
 	"os"
+	"os/signal"
+	"slices"
 	"sync"
+	"syscall"
 	"time"
 )
 
@@ -37,103 +42,6 @@ import (
 // ConfigReloader:
 // signal watcher which triggers reload
 //
-
-// packet bit position data
-// 0 - 3       => instanceID
-// 4 - 7       => number of IPs whose info available
-// 8           => 1 = Master / 0 = Backup
-// 9 - 23      => Priority
-// 24 - x      => 2 bit per IP / rounded up to multiple of byte (8 bits)
-// 16 bits     => MyNumber
-// 16 bits     => LastPeerNumber
-// 8 bits      => RxTimeAgo
-// 32/128 bits => OtherIPs
-// 8 bits      => rtt
-// 8 bits      => lastRxTimeAgo
-
-// type TimeInfo struct {
-// 	rtt       uint8
-// 	rxTimeAgo uint8
-// }
-
-// ==================================================
-// Packet
-// ==================================================
-type Packet struct {
-	InstanceID uint8
-	IsMaster   bool
-	Priority   uint16
-	SelfNum    uint16
-	PeerNum    uint16
-	PeerRxAgo  uint16
-	// otherIPCount    uint8
-	// otherIPInfo     []byte // where v4 or v6
-	// otherIPTimeInfo map[netip.Addr]TimeInfo
-}
-
-func indexCheck(raw []byte, idx int) error {
-	if len(raw) == idx+1 {
-		return nil
-	}
-	return fmt.Errorf("packet has no data till byte idx %d", idx)
-}
-
-func (p *Packet) Unmarshal(raw []byte) error {
-	if err := indexCheck(raw, 8); err != nil {
-		return err
-	}
-	p.InstanceID = raw[0]
-	p.IsMaster = false
-	if raw[1]>>7 == 1 {
-		p.IsMaster = true
-	}
-	p.Priority = (uint16(raw[1])&uint16(127))<<8 | uint16(raw[2])
-	p.SelfNum = uint16(raw[3])<<8 | uint16(raw[4])
-	p.PeerNum = uint16(raw[5])<<8 | uint16(raw[6])
-	p.PeerRxAgo = uint16(raw[7])<<8 | uint16(raw[8])
-	return nil
-}
-
-func (p *Packet) Marshal() []byte {
-	out := make([]byte, 9)
-	out[0] = p.InstanceID
-
-	isMasterBit := 0
-	if p.IsMaster {
-		isMasterBit = 1
-	}
-	out[1] = byte(isMasterBit)<<7 | (byte(p.Priority>>8) & 0x7f)
-	out[2] = byte(p.Priority)
-	out[3] = byte(p.SelfNum >> 8)
-	out[4] = byte(p.SelfNum)
-	out[5] = byte(p.PeerNum >> 8)
-	out[6] = byte(p.PeerNum)
-	out[7] = byte(p.PeerRxAgo >> 8)
-	out[8] = byte(p.PeerRxAgo)
-	return out
-}
-
-type PacketRx struct {
-	Packet
-	RecvTime time.Time
-	Src      string
-}
-
-func (p *PacketRx) UnmarshalWithTime(raw []byte) error {
-	p.RecvTime = time.Now()
-	return p.Unmarshal(raw)
-}
-
-type PacketTx struct {
-	Packet
-	SendTime time.Time
-	Dst      string
-}
-
-func (p *PacketTx) MarshalAndSetTime() []byte {
-	p.SendTime = time.Now()
-	return p.Marshal()
-}
 
 // ==================================================
 // State, Event, Remote
@@ -167,6 +75,9 @@ type RemoteInfo struct {
 	// sentPacketChan chan PacketTx
 	globalSenderNotifyChan <-chan SenderNotifyEvent
 	perSenderNotifyChan    chan SenderNotifyEvent
+	packetsSent            *utils.RingBuffer[pt.PacketTx]
+	packetRecv             *pt.PacketRx
+	rtts                   *utils.RingBuffer[time.Duration]
 }
 
 // ==================================================
@@ -180,8 +91,8 @@ type PacketHandler struct {
 	selfIPPort          string
 	remoteMap           map[string]RemoteInfo
 	wg                  sync.WaitGroup
-	recvChan            chan PacketRx
-	sendChan            chan PacketTx
+	recvChan            chan pt.PacketRx
+	sendChan            chan pt.PacketTx
 	senderBroadcastChan chan SenderNotifyEvent
 	fanout              *utils.FanOut[SenderNotifyEvent]
 }
@@ -194,7 +105,10 @@ func NewPacketHandler(log *slog.Logger, evalIntv, advertInvt int, selfIPPort str
 		remoteMap[dstIP.String()] = RemoteInfo{
 			dstPort:             int(dstPort),
 			srcPort:             port,
-			perSenderNotifyChan: make(chan SenderNotifyEvent)}
+			perSenderNotifyChan: make(chan SenderNotifyEvent),
+			packetsSent:         utils.NewRingBuffer[pt.PacketTx](16),
+			rtts:                utils.NewRingBuffer[time.Duration](512),
+		}
 		port += 1
 	}
 
@@ -206,8 +120,8 @@ func NewPacketHandler(log *slog.Logger, evalIntv, advertInvt int, selfIPPort str
 		selfIPPort:          selfIPPort,
 		remoteMap:           remoteMap,
 		wg:                  sync.WaitGroup{},
-		recvChan:            make(chan PacketRx, 128),
-		sendChan:            make(chan PacketTx, 128),
+		recvChan:            make(chan pt.PacketRx, 128),
+		sendChan:            make(chan pt.PacketTx, 128),
 		senderBroadcastChan: senderBroadcastChan,
 		fanout:              utils.NewFanOut(context.Background(), senderBroadcastChan),
 	}
@@ -239,7 +153,7 @@ func (p *PacketHandler) Listen() {
 		}
 		log.Debug("rx data", slog.Any("remote", remote.String()), slog.Any("data", string(data[:n])))
 
-		packet := PacketRx{Src: remote.AddrPort().String()}
+		packet := pt.PacketRx{Src: remote.AddrPort().String()}
 		if err := packet.UnmarshalWithTime(data[:n]); err != nil {
 			log.Error("unable to unmarshal packet", slog.Any("err", err))
 			continue
@@ -257,11 +171,25 @@ func (p *PacketHandler) Send() {
 	log.Info("sending udp")
 	defer log.Info("closing sending udp conn")
 
+	since := func(t time.Time) int64 {
+		if t.Equal(time.Time{}) {
+			return 0
+		}
+		return time.Since(t).Milliseconds()
+	}
+
 	srcIP, _ := utils.AddrPortOrDefaults(p.selfIPPort)
 	for dstIP, info := range p.remoteMap {
 		src := &net.UDPAddr{IP: srcIP, Port: info.srcPort}
 		destIP, _ := utils.AddrPortOrDefaults(dstIP)
 		dest := &net.UDPAddr{IP: destIP, Port: info.dstPort}
+
+		var packet pt.PacketTx
+		prio := uint16(0)
+		isMaster := false
+		selfNum := uint16(1)
+		peerNum := uint16(0)
+		peerNumRxTime := time.Time{}
 
 		for {
 			log = log.With("rIPPort", dstIP)
@@ -273,22 +201,10 @@ func (p *PacketHandler) Send() {
 			}
 			defer conn.Close()
 
-			var packet PacketTx
-			prio := uint16(0)
-			isMaster := false
-			selfNum := uint16(1)
-			peerNum := uint16(0)
-			peerNumRxTime := time.Time{}
-
-			since := func(t time.Time) int64 {
-				if t.Equal(time.Time{}) {
-					return 0
-				}
-				return time.Since(t).Milliseconds()
-			}
-
 			ticker := time.NewTicker(time.Millisecond * time.Duration(p.advertIntv))
 			perSenderNotifyChan := utils.Forwarder(context.Background(), info.perSenderNotifyChan)
+
+		loop:
 			for {
 				select {
 				case <-ticker.C:
@@ -297,16 +213,16 @@ func (p *PacketHandler) Send() {
 						selfNum += 1
 					}
 
-					packet = PacketTx{
-						Packet: Packet{
+					packet = pt.PacketTx{
+						Packet: pt.Packet{
 							InstanceID: 10,
 							IsMaster:   isMaster,
 							Priority:   prio,
 							SelfNum:    selfNum,
 							PeerNum:    peerNum,
-							PeerRxAgo:  utils.Min(0xffff, uint16(since(peerNumRxTime))),
+							PeerRxAgo:  uint16(utils.Min(0xffff, since(peerNumRxTime))),
 						},
-						Dst: dest.AddrPort().String(),
+						DstIP: dest.IP.String(),
 					}
 
 					data := packet.MarshalAndSetTime()
@@ -314,7 +230,7 @@ func (p *PacketHandler) Send() {
 					if err != nil {
 						log.Error("unable to write to client", slog.Any("err", err))
 						conn.Close()
-						break
+						break loop
 					}
 
 					p.sendChan <- packet
@@ -335,7 +251,7 @@ func (p *PacketHandler) Send() {
 	}
 }
 
-func (p *PacketHandler) run() {
+func (p *PacketHandler) run(ctx context.Context) {
 	log := p.log.With("role", "main")
 
 	p.fanout.Run()
@@ -351,12 +267,17 @@ func (p *PacketHandler) run() {
 	p.wg.Add(1)
 	go p.Send()
 
-	// thresholdDuration := 3 * float32(p.advertIntv)
+	thresholdDuration := time.Millisecond * time.Duration(3*p.advertIntv)
+	validFactor := 2
+	maxMasterPrioBase := uint16(0xfff) // 15 bits field
+	maxMasterPrio := maxMasterPrioBase
 
-	currState := BackupState
-	prevState := BackupState
+	currHAState := BackupState
+	prevHAState := BackupState
 	currNotifyEvent := SenderNotifyEvent{}
 	lastSentNotifyEvent := SenderNotifyEvent{}
+
+	var riseTimeStart *time.Time
 
 	rateMax := 50
 	rate := uint16(rand.IntN(rateMax)) + 1
@@ -364,19 +285,23 @@ func (p *PacketHandler) run() {
 	ticker := time.NewTicker(time.Millisecond * time.Duration(p.evalIntv))
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case sent := <-p.sendChan: // Send to IP2:5000
-			// update map[netip.Addr]PacketTx
-			// Save few SelfNum which were sent to Dst
-			log.Info("sendChan", slog.Any("packetTx", sent))
+			log.Debug("sendChan", slog.Any("packetTx", sent))
 
-			// p.remoteMap[sent.Dst]
-
+			info, ok := p.remoteMap[sent.DstIP]
+			if !ok {
+				log.Warn("packet sent not in remoteMap", slog.Any("dstIP", sent.DstIP))
+				continue
+			}
+			info.packetsSent.Write(sent)
 			continue
 		case recv := <-p.recvChan: // Recv from IP2:xyz
 			// update map[netip.Addr]PacketRx
 			// PreviousSelfNum = PacketRx.LastPeerNum
 			// rtt = PreviousSelfNum.RxTime - PreviousSelfNum.TxTime -(PacketRx.rxTimeAgo)
-			log.Info("recvChan", slog.Any("packetRx", recv))
+			log.Debug("recvChan", slog.Any("packetRx", recv))
 			// send Sender for this IP:
 			//    PacketRx.SelfNum which becomes PacketTx.LastPeerNum
 			//    PacketRx.RecvTime so that it calculates PacketTx.PeerRxAgo
@@ -389,6 +314,25 @@ func (p *PacketHandler) run() {
 					log.Debug("sending notification to specific sender", slog.String("sender", recv.Src),
 						slog.Any("peerNum", recv.PeerNum), slog.Any("peerRxTime", recv.RecvTime))
 					info.perSenderNotifyChan <- SenderNotifyEvent{peerNum: recv.SelfNum, peerNumRxTime: recv.RecvTime}
+
+					info.packetRecv = &recv
+
+					sentPackets := info.packetsSent.Values()
+					idx := slices.IndexFunc(sentPackets, func(pkt pt.PacketTx) bool {
+						return recv.PeerNum == pkt.SelfNum
+					})
+					if idx != -1 {
+						if recv.PeerRxAgo != 0xffff {
+							matchingPacket := sentPackets[idx]
+							rtt := recv.RecvTime.Sub(matchingPacket.SendTime) - (time.Millisecond * time.Duration(recv.PeerRxAgo))
+							log.Info("rtt calculated", "rtt", rtt.Microseconds())
+							// info.rtts.Write(rtt)
+						}
+					} else {
+						log.Info("recv packet not found in sent packets")
+					}
+
+					p.remoteMap[dstIP] = info
 					break
 				}
 			}
@@ -401,47 +345,152 @@ func (p *PacketHandler) run() {
 		}
 		ticker.Stop()
 
-		// Evaluate broadcast notification
-		currNotifyEvent = SenderNotifyEvent{haState: currState}
-		if currState == FaultState && currState != prevState {
-			currNotifyEvent.prio = 0
-		} else if currState == FaultState && currState == prevState {
-			currNotifyEvent.prio = 0
-		} else if currState == BackupState && currState != prevState {
-			currNotifyEvent.prio = 0
-			rate = uint16(rand.IntN(rateMax)) + 1
-		} else if currState == BackupState && currState == prevState {
-			currNotifyEvent.prio = (lastSentNotifyEvent.prio + rate) & uint16(0x7fff)
-		} else if currState == MasterState && currState != prevState {
-			currNotifyEvent.prio = 0
-			rate = uint16(rand.IntN(rateMax)) + 1
-		} else if currState == MasterState && currState == prevState {
-			currNotifyEvent.prio = utils.Min(0x7fff, lastSentNotifyEvent.prio+rate)
+		timeNow := time.Now()
+		masterExists := false
+		haState := currHAState
+		switch haState {
+		case FaultState:
+			// todo: check if all check_scripts have passed;
+			// if so promote to backup
+
+		case BackupState:
+			// todo: check checks scripts; if failed fall back to FaulState
+
+			// Any master exists
+			if slices.ContainsFunc(slices.Collect(maps.Values(p.remoteMap)), func(ri RemoteInfo) bool {
+				if ri.packetRecv != nil {
+					if timeNow.Sub(ri.packetRecv.RecvTime) > time.Millisecond*time.Duration(validFactor*p.advertIntv) {
+						return false
+					}
+					return ri.packetRecv.IsMaster
+				}
+				return false
+			}) {
+				masterExists = true
+				break
+			}
+
+			// Any Peer has high prio
+			peerHasHighPrio := false
+			selfPrio := currNotifyEvent.prio
+			for _, info := range p.remoteMap {
+				if info.packetRecv == nil {
+					continue
+				}
+
+				if timeNow.Sub(info.packetRecv.RecvTime) > time.Millisecond*time.Duration(validFactor*p.advertIntv) {
+					continue
+				}
+
+				if selfPrio < info.packetRecv.Priority {
+					peerHasHighPrio = true
+					break
+				}
+			}
+			if peerHasHighPrio {
+				break
+			}
+
+			// Did self cross threshold ?
+			if riseTimeStart == nil {
+				riseTimeStart = utils.PtrTo(time.Now())
+			}
+			if time.Since(*riseTimeStart) > thresholdDuration {
+				currHAState = MasterState
+				maxMasterPrio = maxMasterPrioBase + uint16(rand.Int32N(100))
+				riseTimeStart = nil
+			}
+		case MasterState:
+			// todo: check checks scripts; if failed fall back to FaulState
+
+			// todo: if any Peer is master, check prio
+			// if self > peer: remain master
+			// else; drop master
+			peerHasHighPrio := false
+			selfPrio := currNotifyEvent.prio
+			for _, info := range p.remoteMap {
+				if info.packetRecv == nil {
+					continue
+				}
+
+				if !info.packetRecv.IsMaster {
+					continue
+				}
+
+				if timeNow.Sub(info.packetRecv.RecvTime) > time.Millisecond*time.Duration(validFactor*p.advertIntv) {
+					continue
+				}
+
+				if selfPrio < info.packetRecv.Priority {
+					peerHasHighPrio = true
+					break
+				}
+			}
+			if peerHasHighPrio {
+				currHAState = BackupState
+				if riseTimeStart == nil {
+					riseTimeStart = utils.PtrTo(time.Now())
+				}
+				break
+			}
+
+			// todo: Are we receiving packets from 1 out of min 2 peers.
+			// if 0/2+; drop master; network down
+			// if 0/1; remain master
+			if len(p.remoteMap) > 1 {
+				if !slices.ContainsFunc(slices.Collect(maps.Values(p.remoteMap)), func(ri RemoteInfo) bool {
+					if ri.packetRecv != nil {
+						return timeNow.Sub(ri.packetRecv.RecvTime) < time.Millisecond*time.Duration(validFactor*p.advertIntv)
+					}
+					return false
+				}) {
+					currHAState = BackupState
+					if riseTimeStart == nil {
+						riseTimeStart = utils.PtrTo(time.Now())
+					}
+				}
+			}
+
 		}
-		prevState = currState
+
+		// ==========================================================================
+		// Evaluate broadcast notification (setting prio based on currState,prevState)
+		currNotifyEvent = SenderNotifyEvent{haState: currHAState}
+
+		switch currHAState {
+		case FaultState:
+			currNotifyEvent.prio = 0
+		case BackupState:
+			if masterExists {
+				currNotifyEvent.prio = 0
+				break
+			}
+
+			switch prevHAState {
+			case BackupState:
+				currNotifyEvent.prio = (lastSentNotifyEvent.prio + rate) & uint16(0x7fff)
+			default:
+				riseTimeStart = utils.PtrTo(time.Now())
+
+				currNotifyEvent.prio = 0
+				rate = uint16(rand.IntN(rateMax)) + 1
+			}
+		case MasterState:
+			switch prevHAState {
+			case MasterState:
+				currNotifyEvent.prio = utils.Min(maxMasterPrio, lastSentNotifyEvent.prio+rate)
+			default:
+				currNotifyEvent.prio = 0
+				rate = uint16(rand.IntN(rateMax)) + 1
+			}
+		}
+		prevHAState = currHAState
 
 		if currNotifyEvent != lastSentNotifyEvent {
 			p.senderBroadcastChan <- currNotifyEvent
 			lastSentNotifyEvent = currNotifyEvent
+			log.Info("changed", "currNotifyEvent", currNotifyEvent.String())
 		}
-
-		// Collect from all Sends about their packet sent:
-		//   update map[netip.Addr]PacketTx
-		//
-		// Broadcast to all Sends about {state,prio}
-		//
-		// If any -> fault:
-		//   broadcast prio=0, state=0
-		// if fault:
-		//   broadcast prio=0, state=0
-		// If any -> backup:
-		//   broadcast prio=0 state=0
-		// if backup:
-		//   broadcast prio=prio+1 state=0
-		// if backup -> master:
-		//   broadcast prio=0 state=1
-		// If master:
-		//   broadcast prio=prio+1 state=1
 
 		ticker.Reset(time.Millisecond * time.Duration(p.evalIntv))
 	}
@@ -461,11 +510,19 @@ func main() {
 
 	flag.Parse()
 
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+	exit := make(chan os.Signal, 1)
+	signal.Notify(exit, os.Interrupt, syscall.SIGTERM)
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-exit
+		cancel()
+	}()
+
+	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
 	log.Info("main started")
 	defer log.Info("main finished")
 
 	// InstanceID
 	ph := NewPacketHandler(log, evalIntvMs, advertIntvMs, selfIPPort, remoteIPPort)
-	ph.run()
+	ph.run(ctx)
 }
