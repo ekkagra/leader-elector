@@ -5,8 +5,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"mux/internal/utils"
+	"os"
 	"sync"
 	"time"
+
+	"github.com/fsnotify/fsnotify"
 )
 
 var ErrEventSourceFinished = errors.New("event source finished in mux")
@@ -15,7 +19,7 @@ type UpdateFunc[T any] func(data any, state *T) error
 
 type EventSourceInterface[T any] interface {
 	Name() string
-	Start(ctx context.Context, out chan<- Event)
+	Start(ctx context.Context, config <-chan string, out chan<- Event)
 	UpdateFunc() UpdateFunc[T]
 }
 
@@ -47,21 +51,24 @@ type EventSourceInfo[T any] struct {
 }
 
 type Mux[T any] struct {
+	configFile      string
 	state           *T
 	log             *slog.Logger
 	muxChan         chan Event
 	wg              sync.WaitGroup
 	eventSourceInfo map[string]EventSourceInfo[T]
+	fanout          *utils.FanOut[string]
 	reconciler      ReconcilerInterface[T]
 	backoffRequeuer *requeuer[T]
 	timedRequeuer   *requeuer[T]
 }
 
-func NewMux[T any](log *slog.Logger, stateInitializer func() *T) *Mux[T] {
+func NewMux[T any](log *slog.Logger, configFile string, stateInitializer func() *T) *Mux[T] {
 	brq := newRequeuer[T]("requeue", time.Second)
 	trq := newRequeuer[T]("requeue-after", time.Second)
 
 	m := &Mux[T]{
+		configFile:      configFile,
 		state:           stateInitializer(),
 		log:             log,
 		muxChan:         make(chan Event, 128),
@@ -78,9 +85,13 @@ func NewMux[T any](log *slog.Logger, stateInitializer func() *T) *Mux[T] {
 
 func (m *Mux[T]) startEventSource(ctx context.Context, source EventSourceInterface[T]) {
 	m.wg.Add(1)
+	configChan := m.fanout.Add(source.Name())
 	go func() {
-		defer m.wg.Done()
-		source.Start(ctx, m.muxChan)
+		defer func() {
+			m.fanout.Delete(source.Name())
+			m.wg.Done()
+		}()
+		source.Start(ctx, configChan, m.muxChan)
 		m.muxChan <- Event{Name: source.Name(), Err: ErrEventSourceFinished}
 	}()
 }
@@ -112,8 +123,21 @@ func (m *Mux[T]) SetReconciler(r ReconcilerInterface[T]) {
 	m.reconciler = r
 }
 
-func (m *Mux[T]) Run(ctx context.Context) {
+func (m *Mux[T]) Run(ctx context.Context) error {
 	m.log.Info("Starting mux")
+
+	fileOps := []fsnotify.Op{fsnotify.Create, fsnotify.Rename}
+	configChan, err := utils.FileWatcher(ctx, m.configFile, fileOps, func(ev fsnotify.Event) string {
+		cont, _ := os.ReadFile(ev.Name)
+		return string(cont)
+	})
+	if err != nil {
+		m.log.Error("unable to start file watcher for config", slog.Any("err", err))
+		return err
+	}
+
+	m.fanout = utils.NewFanOut(ctx, configChan)
+	m.fanout.Run()
 
 	for _, evSource := range m.eventSourceInfo {
 		m.startEventSource(ctx, evSource.src)
@@ -160,6 +184,7 @@ func (m *Mux[T]) Run(ctx context.Context) {
 			m.backoffRequeuer.ticker.Reset(time.Second)
 		}
 	}
+	return nil
 }
 
 // ------------------------------------
@@ -179,7 +204,7 @@ func newRequeuer[T any](name string, duration time.Duration) *requeuer[T] {
 	}
 }
 
-func (r *requeuer[T]) Start(ctx context.Context, out chan<- Event) {
+func (r *requeuer[T]) Start(ctx context.Context, _ <-chan string, out chan<- Event) {
 	for {
 		select {
 		case <-ctx.Done():

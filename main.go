@@ -17,19 +17,9 @@ func main() {
 	log.Info("main started")
 	defer log.Info("main finished")
 
-	var conn bool
-	var selfIPPort string
-	var remoteIPPort string
-	flag.StringVar(&selfIPPort, "selfIPPort", "", "selfIPPort")
-	flag.StringVar(&remoteIPPort, "remoteIPPort", "127.0.0.4:5000", "remoteIPPort")
-	flag.BoolVar(&conn, "conn", false, "connection oriented")
+	var configFile string
+	flag.StringVar(&configFile, "configFile", "./config.json", "Config file path")
 	flag.Parse()
-
-	// if conn {
-	// 	packet.GenerateConn(log, selfIPPort, remoteIPPort)
-	// } else {
-	// 	packet.GenerateNoConn(log, selfIPPort, remoteIPPort)
-	// }
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -38,16 +28,18 @@ func main() {
 		cancel()
 	}()
 
-	mux := multiplexer.NewMux(log.With("comp", "mux"), func() *state.State {
+	mux := multiplexer.NewMux(log.With("comp", "mux"), configFile, func() *state.State {
 		return &state.State{}
 	})
 
 	count := 1
 	for i := range count {
-		mux.AddEventSource(multiplexer.NewFileEventSource(fmt.Sprintf("file-change-%d", i), i+1))
+		mux.AddEventSource(multiplexer.NewFileEventSource(fmt.Sprintf("file-change-%d", i), log.With("evSource", "file-change"), i+1))
 	}
 
 	mux.SetReconciler(&multiplexer.Reconciler{Log: log.With("comp", "reconciler")})
 
-	mux.Run(ctx)
+	if err := mux.Run(ctx); err != nil {
+		os.Exit(1)
+	}
 }

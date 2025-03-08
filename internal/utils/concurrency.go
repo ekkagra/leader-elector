@@ -73,12 +73,12 @@ type updateEvent[T any] struct {
 
 type FanOut[T any] struct {
 	ctx          context.Context
-	inChan       chan T
+	inChan       <-chan T
 	updateChan   chan updateEvent[T]
 	forwarderMap map[string]*forwarderInfo[T]
 }
 
-func NewFanOut[T any](ctx context.Context, inChan chan T) *FanOut[T] {
+func NewFanOut[T any](ctx context.Context, inChan <-chan T) *FanOut[T] {
 	return &FanOut[T]{
 		ctx:          ctx,
 		inChan:       inChan,
@@ -88,17 +88,20 @@ func NewFanOut[T any](ctx context.Context, inChan chan T) *FanOut[T] {
 }
 
 func (f *FanOut[T]) Add(name string) <-chan T {
-	inChan := make(chan T)
-	outChan := make(chan T)
 	ctx, cancel := context.WithCancel(f.ctx)
 
 	event := updateEvent[T]{
-		forwarderInfo: &forwarderInfo[T]{name: name, inChan: inChan, outChan: outChan, ctx: ctx, cancel: cancel},
-		eventType:     addEvent,
+		forwarderInfo: &forwarderInfo[T]{
+			name:    name,
+			inChan:  make(chan T),
+			outChan: make(chan T),
+			ctx:     ctx,
+			cancel:  cancel},
+		eventType: addEvent,
 	}
 
 	f.updateChan <- event
-	return outChan
+	return event.forwarderInfo.outChan
 }
 
 func (f *FanOut[T]) Delete(name string) {
@@ -119,17 +122,19 @@ func (f *FanOut[T]) run() {
 		}
 	}()
 
+	var val *T
 	input := Forwarder(f.ctx, f.inChan)
 	for {
 		select {
 		case <-f.ctx.Done():
 			return
-		case val, open := <-input:
+		case value, open := <-input:
+			val = &value
 			if !open {
 				return
 			}
 			for _, out := range f.forwarderMap {
-				out.inChan <- val
+				out.inChan <- *val
 			}
 		case ev := <-f.updateChan:
 			switch ev.eventType {
@@ -139,6 +144,9 @@ func (f *FanOut[T]) run() {
 					defer close(ev.forwarderInfo.outChan)
 					forwarder(ev.forwarderInfo.ctx, ev.forwarderInfo.inChan, ev.forwarderInfo.outChan)
 				}()
+				if val != nil {
+					ev.forwarderInfo.inChan <- *val
+				}
 			case delEvent:
 				outChanInfo, ok := f.forwarderMap[ev.forwarderInfo.name]
 				if ok && outChanInfo.cancel != nil {
@@ -151,5 +159,10 @@ func (f *FanOut[T]) run() {
 }
 
 func (f *FanOut[T]) Run() {
-	go f.run()
+	started := make(chan struct{})
+	go func() {
+		started <- struct{}{}
+		f.run()
+	}()
+	<-started
 }
