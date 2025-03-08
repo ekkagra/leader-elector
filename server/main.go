@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"slices"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -56,6 +57,23 @@ const (
 	MasterState
 	MasterRxLowerPriState
 )
+
+func (h *HAState) String() string {
+	switch *h {
+	case UnknownState:
+		return "Unknown"
+	case FaultState:
+		return "Fault"
+	case BackupState:
+		return "Backup"
+	case MasterState:
+		return "Master"
+	case MasterRxLowerPriState:
+		return "MasterRxLowerPri"
+	default:
+		return "Unknown"
+	}
+}
 
 type SenderNotifyEvent struct {
 	haState       HAState
@@ -267,7 +285,7 @@ func (p *PacketHandler) run(ctx context.Context) {
 	p.wg.Add(1)
 	go p.Send()
 
-	thresholdDuration := time.Millisecond * time.Duration(3*p.advertIntv)
+	thresholdDuration := time.Millisecond * time.Duration(2*p.advertIntv)
 	validFactor := 2
 	maxMasterPrioBase := uint16(0xfff) // 15 bits field
 	maxMasterPrio := maxMasterPrioBase
@@ -428,9 +446,6 @@ func (p *PacketHandler) run(ctx context.Context) {
 			}
 			if peerHasHighPrio {
 				currHAState = BackupState
-				if riseTimeStart == nil {
-					riseTimeStart = utils.PtrTo(time.Now())
-				}
 				break
 			}
 
@@ -445,9 +460,6 @@ func (p *PacketHandler) run(ctx context.Context) {
 					return false
 				}) {
 					currHAState = BackupState
-					if riseTimeStart == nil {
-						riseTimeStart = utils.PtrTo(time.Now())
-					}
 				}
 			}
 
@@ -470,8 +482,6 @@ func (p *PacketHandler) run(ctx context.Context) {
 			case BackupState:
 				currNotifyEvent.prio = (lastSentNotifyEvent.prio + rate) & uint16(0x7fff)
 			default:
-				riseTimeStart = utils.PtrTo(time.Now())
-
 				currNotifyEvent.prio = 0
 				rate = uint16(rand.IntN(rateMax)) + 1
 			}
@@ -487,6 +497,10 @@ func (p *PacketHandler) run(ctx context.Context) {
 		prevHAState = currHAState
 
 		if currNotifyEvent != lastSentNotifyEvent {
+			if currNotifyEvent.haState != lastSentNotifyEvent.haState {
+				log.Warn("HA state change", "old", lastSentNotifyEvent.haState.String(),
+					"new", currNotifyEvent.haState.String())
+			}
 			p.senderBroadcastChan <- currNotifyEvent
 			lastSentNotifyEvent = currNotifyEvent
 			log.Info("changed", "currNotifyEvent", currNotifyEvent.String())
@@ -502,13 +516,15 @@ func main() {
 	var remoteIPPort string
 	var evalIntvMs int
 	var advertIntvMs int
+	var logLevelStr string
 	flag.StringVar(&name, "name", "aaa", "name or id")
 	flag.StringVar(&selfIPPort, "selfIPPort", ":5000", "IP:PORT or :PORT format")
 	flag.IntVar(&evalIntvMs, "evalIntv", 500, "Main loop Evaluation interval in milliseconds")
 	flag.IntVar(&advertIntvMs, "advertIntv", 1000, "Advert interval in milliseconds")
 	flag.StringVar(&remoteIPPort, "remoteIPPort", "127.0.0.4:5000", "IP:PORT ot :PORT format")
+	flag.StringVar(&logLevelStr, "logLevel", "info", "log level")
 
-	flag.Parse()
+	// flag.Parse()
 
 	exit := make(chan os.Signal, 1)
 	signal.Notify(exit, os.Interrupt, syscall.SIGTERM)
@@ -518,9 +534,33 @@ func main() {
 		cancel()
 	}()
 
-	log := slog.New(slog.NewTextHandler(os.Stdout, nil))
-	log.Info("main started")
-	defer log.Info("main finished")
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+
+		if _, err := os.Stat("./inputs"); err != nil {
+			fmt.Println("sleeping ... waiting for file")
+			time.Sleep(time.Millisecond * 600)
+			continue
+		}
+		time.Sleep(time.Second)
+		cont, err := os.ReadFile("./inputs")
+		if err != nil {
+			continue
+		}
+
+		flag.CommandLine.Parse(strings.Fields(string(cont)))
+		fmt.Println("parsed")
+		break
+	}
+
+	logLevel := slog.LevelInfo
+	logLevel.UnmarshalText([]byte(logLevelStr))
+
+	log := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: logLevel}))
+	log.Warn("main started")
+	defer log.Warn("main finished")
 
 	// InstanceID
 	ph := NewPacketHandler(log, evalIntvMs, advertIntvMs, selfIPPort, remoteIPPort)

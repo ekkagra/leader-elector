@@ -1,8 +1,9 @@
-package main
+package multiplexer
 
 import (
 	"context"
 	"fmt"
+	"mux/internal/state"
 	"time"
 )
 
@@ -32,14 +33,14 @@ func (f *FileEventSource) Start(ctx context.Context, outChan chan<- Event) {
 	}
 }
 
-func (f *FileEventSource) UpdateFunc() UpdateFunc[State] {
-	return func(data any, state *State) error {
+func (f *FileEventSource) UpdateFunc() UpdateFunc[state.State] {
+	return func(data any, state *state.State) error {
 		val, ok := data.(int)
 		if !ok {
 			return fmt.Errorf("unable to cast to int")
 		}
 
-		state.fileState = val
+		state.FileState = val
 		return nil
 	}
 }

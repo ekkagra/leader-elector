@@ -1,4 +1,4 @@
-package main
+package multiplexer
 
 import (
 	"context"
@@ -47,24 +47,33 @@ type EventSourceInfo[T any] struct {
 }
 
 type Mux[T any] struct {
-	state            *T
-	log              *slog.Logger
-	muxChan          chan Event
-	wg               sync.WaitGroup
-	eventSourceInfo  map[string]EventSourceInfo[T]
-	reconciler       ReconcilerInterface[T]
-	clearRequeueChan chan struct{}
+	state           *T
+	log             *slog.Logger
+	muxChan         chan Event
+	wg              sync.WaitGroup
+	eventSourceInfo map[string]EventSourceInfo[T]
+	reconciler      ReconcilerInterface[T]
+	backoffRequeuer *requeuer[T]
+	timedRequeuer   *requeuer[T]
 }
 
 func NewMux[T any](log *slog.Logger, stateInitializer func() *T) *Mux[T] {
-	return &Mux[T]{
-		state:            stateInitializer(),
-		log:              log,
-		muxChan:          make(chan Event, 128),
-		wg:               sync.WaitGroup{},
-		eventSourceInfo:  make(map[string]EventSourceInfo[T]),
-		clearRequeueChan: nil,
+	brq := newRequeuer[T]("requeue", time.Second)
+	trq := newRequeuer[T]("requeue-after", time.Second)
+
+	m := &Mux[T]{
+		state:           stateInitializer(),
+		log:             log,
+		muxChan:         make(chan Event, 128),
+		wg:              sync.WaitGroup{},
+		eventSourceInfo: make(map[string]EventSourceInfo[T]),
+		backoffRequeuer: brq,
+		timedRequeuer:   trq,
 	}
+
+	m.AddEventSource(brq)
+	m.AddEventSource(trq)
+	return m
 }
 
 func (m *Mux[T]) startEventSource(ctx context.Context, source EventSourceInterface[T]) {
@@ -115,19 +124,25 @@ func (m *Mux[T]) Run(ctx context.Context) {
 	for ev := range m.muxChan {
 		m.log.Info("event received", ev.Name, ev.Data)
 
-		if ev.Name != "requeue" && ev.Name != "requeue-after" {
-			src, ok := m.eventSourceInfo[ev.Name]
-			if !ok {
-				m.log.Warn("unknown event source", slog.String("name", ev.Name))
-				continue
-			}
+		m.backoffRequeuer.ticker.Stop()
+		if ev.Name == "requeue-after" {
+			m.timedRequeuer.ticker.Stop()
+		}
 
-			if err := src.updateFunc(ev.Data, m.state); err != nil {
-				m.log.Error("unable to update state with events updateFunc", slog.String("event", ev.Name), slog.Any("data", ev.Data))
-				continue
-			}
-		} else if ev.Name == "requeue" {
-			m.resetRequeueChan()
+		src, ok := m.eventSourceInfo[ev.Name]
+		if !ok {
+			m.log.Warn("unknown event source", slog.String("name", ev.Name))
+			continue
+		}
+
+		if ev.Err != nil {
+			m.log.Error("received err for event", slog.String("event", ev.Name), slog.Any("err", ev.Err))
+			continue
+		}
+
+		if err := src.updateFunc(ev.Data, m.state); err != nil {
+			m.log.Error("unable to update state with events updateFunc", slog.String("event", ev.Name), slog.Any("data", ev.Data))
+			continue
 		}
 
 		res, err := m.reconciler.Reconcile(ctx, ev.Name, m.state)
@@ -136,51 +151,43 @@ func (m *Mux[T]) Run(ctx context.Context) {
 			res.Requeue = true
 		}
 
-		if res.Requeue || res.RequeueAfter > 0 {
-			if res.RequeueAfter > 0 {
-				m.requeue(ctx, "requeue-after", res.RequeueAfter, false)
-				continue
-			}
-
-			if err != nil {
-				m.resetRequeueChan()
-				m.requeue(ctx, "requeue", time.Second*2, true)
-				continue
-			}
-
-			if m.clearRequeueChan != nil {
-				continue
-			}
-			m.requeue(ctx, "requeue", time.Second*2, true)
+		if res.RequeueAfter > 0 {
+			m.timedRequeuer.ticker.Reset(res.RequeueAfter)
+			continue
 		}
-		m.resetRequeueChan()
+
+		if res.Requeue {
+			m.backoffRequeuer.ticker.Reset(time.Second)
+		}
 	}
 }
 
-func (m *Mux[T]) resetRequeueChan() {
-	if m.clearRequeueChan != nil {
-		close(m.clearRequeueChan)
-		m.clearRequeueChan = nil
+// ------------------------------------
+// Requeuer
+type requeuer[T any] struct {
+	NilUpdateEventSource[T]
+	ticker *time.Ticker
+}
+
+func newRequeuer[T any](name string, duration time.Duration) *requeuer[T] {
+	t := time.NewTicker(duration)
+	t.Stop()
+
+	return &requeuer[T]{
+		NilUpdateEventSource: NilUpdateEventSource[T]{Named{name}},
+		ticker:               t,
 	}
 }
 
-func (m *Mux[T]) requeue(ctx context.Context, name string, delay time.Duration, cancellable bool) {
-	var clearChan chan struct{}
-	if cancellable {
-		m.clearRequeueChan = make(chan struct{})
-		clearChan = m.clearRequeueChan
-	}
-
-	go func() {
+func (r *requeuer[T]) Start(ctx context.Context, out chan<- Event) {
+	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-time.After(delay):
-			m.muxChan <- Event{Name: name}
-		case <-clearChan:
-			return
+		case <-r.ticker.C:
+			out <- Event{Name: r.EvName}
 		}
-	}()
+	}
 }
 
 type Result struct {
