@@ -3,13 +3,27 @@ package main
 import (
 	"context"
 	"flag"
-	"fmt"
 	"log/slog"
+	eventsources "mux/internal/event_sources"
 	"mux/internal/multiplexer"
 	"mux/internal/state"
 	"os"
-	"time"
+	"os/signal"
+	"syscall"
 )
+
+func setupSignalHandler() context.Context {
+	exit := make(chan os.Signal, 1)
+	signal.Notify(exit, syscall.SIGTERM, syscall.SIGINT)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		<-exit
+		cancel()
+	}()
+
+	return ctx
+}
 
 func main() {
 
@@ -21,25 +35,15 @@ func main() {
 	flag.StringVar(&configFile, "configFile", "./config.json", "Config file path")
 	flag.Parse()
 
-	ctx, cancel := context.WithCancel(context.Background())
-
-	go func() {
-		time.Sleep(time.Second * 30)
-		cancel()
-	}()
-
 	mux := multiplexer.NewMux(log.With("comp", "mux"), configFile, func() *state.State {
 		return &state.State{}
 	})
 
-	count := 1
-	for i := range count {
-		mux.AddEventSource(multiplexer.NewFileEventSource(fmt.Sprintf("file-change-%d", i), log.With("evSource", "file-change"), i+1))
-	}
+	mux.AddEventSource(eventsources.NewListener(log.With("evSource", "listener"), "packet-listener"))
 
 	mux.SetReconciler(&multiplexer.Reconciler{Log: log.With("comp", "reconciler")})
 
-	if err := mux.Run(ctx); err != nil {
+	if err := mux.Run(setupSignalHandler()); err != nil {
 		os.Exit(1)
 	}
 }
