@@ -28,9 +28,7 @@ func FileWatcher[T any](ctx context.Context, filename string, ops []fsnotify.Op,
 		started <- struct{}{}
 
 		if _, err := os.Stat(filename); err == nil {
-			log.Info("sending initial file event")
 			out <- f(fsnotify.Event{Name: filename, Op: fsnotify.Create})
-			log.Info("initial file event sent")
 		}
 
 		for {
@@ -38,7 +36,6 @@ func FileWatcher[T any](ctx context.Context, filename string, ops []fsnotify.Op,
 			case <-ctx.Done():
 				return
 			case ev, open := <-watcher.Events:
-				log.Info("filewatcher event", slog.Any("ev", ev))
 				if !open {
 					return
 				}
@@ -47,6 +44,7 @@ func FileWatcher[T any](ctx context.Context, filename string, ops []fsnotify.Op,
 					continue
 				}
 
+				log.Info("filewatcher event", slog.Any("ev", ev))
 				out <- f(ev)
 			}
 		}

@@ -1,0 +1,31 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: leader-elector-deploy
+  labels:
+    app: leader-elector
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: leader-elector
+  template:
+    metadata:
+      labels:
+        app: leader-elector
+    spec:
+      serviceAccountName: pod-watcher-sa
+      containers:
+        - name: le
+          image: leader-elector:dev
+          imagePullPolicy: IfNotPresent
+          args: ["-configFile", "/workdir/config", "-loglevel", "warn"]
+          ports:
+            - containerPort: 80
+          resources:
+            limits:
+              cpu: 400m
+              memory: 400Mi
+            requests:
+              cpu: 100m
+              memory: 100Mi

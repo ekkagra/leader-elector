@@ -5,6 +5,7 @@ import (
 	"flag"
 	"log/slog"
 	eventsources "mux/internal/event_sources"
+	"mux/internal/k8s"
 	"mux/internal/multiplexer"
 	"mux/internal/packet"
 	"mux/internal/reconciler"
@@ -30,16 +31,24 @@ func setupSignalHandler() context.Context {
 }
 
 func main() {
-
-	log := slog.New(slog.NewJSONHandler(os.Stdout, nil))
-	log.Info("main started")
-	defer log.Info("main finished")
+	slog.Info("main started")
+	defer slog.Info("main finished")
 
 	var configFile string
+	var logLevel string
 	flag.StringVar(&configFile, "configFile", "./config.json", "Config file path")
+	flag.StringVar(&logLevel, "loglevel", "info", "log level")
 	flag.Parse()
 
-	mux := multiplexer.NewMux(setupSignalHandler(), log.With("comp", "mux"), configFile,
+	var level slog.Level
+	level.UnmarshalText([]byte(logLevel))
+	log := slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{Level: level}))
+
+	ctx := setupSignalHandler()
+
+	go k8s.Watch(ctx, log.With("comp", "pod-watcher"), configFile)
+
+	mux := multiplexer.NewMux(ctx, log.With("comp", "mux"), configFile,
 		func() *state.State {
 			return &state.State{
 				HAState:       state.BackupState,

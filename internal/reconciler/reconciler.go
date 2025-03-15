@@ -14,16 +14,16 @@ import (
 )
 
 const (
-	thresholdFactor   = 2
+	thresholdFactor   = 3
 	rateMax           = 50
-	validFactor       = 2
+	validFactor       = 3
 	maxMasterPrioBase = uint16(0xfff)
 )
 
 type Reconciler struct {
 	log        *slog.Logger
-	evalTime   time.Duration
-	advertTime time.Duration
+	evalIntv   time.Duration
+	advertIntv time.Duration
 
 	maxMasterPrio uint16
 	riseTimeStart *time.Time
@@ -37,8 +37,8 @@ func NewReconciler(log *slog.Logger) *Reconciler {
 
 	return &Reconciler{
 		log:        log,
-		evalTime:   time.Millisecond * 100,
-		advertTime: time.Millisecond * 500,
+		evalIntv:   time.Millisecond * 100,
+		advertIntv: time.Millisecond * 500,
 
 		maxMasterPrio: maxMasterPrioBase,
 		rate:          uint16(rand.IntN(rateMax)) + 1,
@@ -49,7 +49,8 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 	r.log.Debug("reconciling event", slog.String("event", event), slog.Any("state", state))
 
 	if event == "config-updater" && state.Config.EvalIntv != 0 {
-		r.evalTime = time.Millisecond * time.Duration(state.Config.EvalIntv)
+		r.evalIntv = time.Millisecond * time.Duration(state.Config.EvalIntv)
+		r.advertIntv = time.Millisecond * time.Duration(state.Config.AdvertIntv)
 	}
 
 	if event == "packet-sender" {
@@ -59,7 +60,6 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 	haState := state.HAState
 	masterExists := false
 	timeNow := time.Now()
-	advertIntv := state.Config.AdvertIntv
 
 	for dst, pkt := range state.PacketRecvMap {
 		if !pkt.Reconciled {
@@ -88,7 +88,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 
 		// Any master exists
 		if slices.ContainsFunc(slices.Collect(maps.Values(state.PacketRecvMap)), func(pkt packet.PacketRx) bool {
-			if timeNow.Sub(pkt.RecvTime) > time.Millisecond*time.Duration(validFactor*advertIntv) {
+			if timeNow.Sub(pkt.RecvTime) > validFactor*r.advertIntv {
 				return false
 			}
 			return pkt.IsMaster
@@ -102,7 +102,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 		selfPrio := r.lastGlobalNotifyEvent.Prio
 		for _, pkt := range state.PacketRecvMap {
 
-			if timeNow.Sub(pkt.RecvTime) > time.Millisecond*time.Duration(validFactor*advertIntv) {
+			if timeNow.Sub(pkt.RecvTime) > validFactor*r.advertIntv {
 				continue
 			}
 
@@ -119,7 +119,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 		if r.riseTimeStart == nil {
 			r.riseTimeStart = utils.PtrTo(time.Now())
 		}
-		if time.Since(*r.riseTimeStart) > thresholdFactor*r.advertTime {
+		if time.Since(*r.riseTimeStart) > thresholdFactor*r.advertIntv {
 			state.HAState = s.MasterState
 			r.maxMasterPrio = maxMasterPrioBase + uint16(rand.Int32N(100))
 			r.riseTimeStart = nil
@@ -138,7 +138,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 				continue
 			}
 
-			if timeNow.Sub(pkt.RecvTime) > time.Millisecond*time.Duration(validFactor*advertIntv) {
+			if timeNow.Sub(pkt.RecvTime) > validFactor*r.advertIntv {
 				continue
 			}
 
@@ -157,7 +157,7 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 		// if 0/1; remain master
 		if len(state.PacketRecvMap) > 1 {
 			if !slices.ContainsFunc(slices.Collect(maps.Values(state.PacketRecvMap)), func(pkt packet.PacketRx) bool {
-				return timeNow.Sub(pkt.RecvTime) < time.Millisecond*time.Duration(validFactor*advertIntv)
+				return timeNow.Sub(pkt.RecvTime) < validFactor*r.advertIntv
 			}) {
 				state.HAState = s.BackupState
 			}
@@ -206,5 +206,5 @@ func (r *Reconciler) Reconcile(ctx context.Context, event string, state *s.State
 		r.log.Info("changed", "currNotifyEvent", currGlobalNotifyEvent.String())
 	}
 
-	return m.Result{RequeueAfter: r.evalTime}, nil
+	return m.Result{RequeueAfter: r.evalIntv}, nil
 }
