@@ -6,7 +6,11 @@ import (
 	"log/slog"
 	eventsources "mux/internal/event_sources"
 	"mux/internal/multiplexer"
+	"mux/internal/packet"
+	"mux/internal/reconciler"
 	"mux/internal/state"
+	"mux/internal/utils"
+	"net/netip"
 	"os"
 	"os/signal"
 	"syscall"
@@ -36,12 +40,17 @@ func main() {
 	flag.Parse()
 
 	mux := multiplexer.NewMux(log.With("comp", "mux"), configFile, func() *state.State {
-		return &state.State{}
+		return &state.State{
+			PacketRecvMap: make(map[netip.AddrPort]packet.PacketRx),
+			PacketSentMap: make(map[netip.Addr]*utils.RingBuffer[packet.PacketTx]),
+		}
 	})
 
 	mux.AddEventSource(eventsources.NewListener(log.With("evSource", "listener"), "packet-listener"))
 
-	mux.SetReconciler(&multiplexer.Reconciler{Log: log.With("comp", "reconciler")})
+	mux.AddEventSource(eventsources.NewPacketSender(log.With("evSoure", "packet-sender"), "packet-sender"))
+
+	mux.SetReconciler(reconciler.NewReconciler(log.With("comp", "reconciler")))
 
 	if err := mux.Run(setupSignalHandler()); err != nil {
 		os.Exit(1)

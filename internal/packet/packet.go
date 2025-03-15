@@ -2,6 +2,7 @@ package packet
 
 import (
 	"fmt"
+	"net/netip"
 	"time"
 )
 
@@ -36,7 +37,7 @@ type Packet struct {
 }
 
 func indexCheck(raw []byte, idx int) error {
-	if len(raw) == idx+1 {
+	if len(raw) >= idx+1 {
 		return nil
 	}
 	return fmt.Errorf("packet has no data till byte idx %d", idx)
@@ -79,8 +80,9 @@ func (p *Packet) Marshal() []byte {
 
 type PacketRx struct {
 	Packet
-	RecvTime time.Time
-	Src      string
+	RecvTime   time.Time
+	Src        string
+	Reconciled bool
 }
 
 func (p *PacketRx) UnmarshalWithTime(raw []byte) error {
@@ -91,7 +93,7 @@ func (p *PacketRx) UnmarshalWithTime(raw []byte) error {
 type PacketTx struct {
 	Packet
 	SendTime time.Time
-	DstIP    string
+	DstIP    netip.Addr
 }
 
 func (p *PacketTx) MarshalAndSetTime() []byte {

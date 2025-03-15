@@ -18,6 +18,10 @@ spec:
       - name: le
         image: leader-elector:dev
         imagePullPolicy: IfNotPresent
+        args: [
+          "-configFile",
+          "/workdir/config"
+        ]
         ports:
         - containerPort: 80
         resources:

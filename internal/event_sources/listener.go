@@ -2,7 +2,6 @@ package eventsources
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"log/slog"
 	m "mux/internal/multiplexer"
@@ -13,19 +12,12 @@ import (
 	"sync"
 )
 
-type ListenCfg struct {
-	ListenAddr struct {
-		IP   netip.Addr `json:"ip"`
-		Port int        `json:"port"`
-	} `json:"listen_addr"`
-}
-
 type Listener struct {
 	m.Named
 	log *slog.Logger
 
-	listenCfg *ListenCfg
-	listener  *net.UDPConn
+	listenAddr *state.Addr
+	listener   *net.UDPConn
 
 	wg sync.WaitGroup
 }
@@ -38,7 +30,7 @@ func NewListener(log *slog.Logger, name string) *Listener {
 	}
 }
 
-func (l *Listener) Start(ctx context.Context, config <-chan string, out chan<- m.Event) {
+func (l *Listener) Start(ctx context.Context, config <-chan state.Config, _ <-chan m.Event, out chan<- m.Event) {
 	defer l.stopListener()
 
 	for {
@@ -46,26 +38,25 @@ func (l *Listener) Start(ctx context.Context, config <-chan string, out chan<- m
 		case <-ctx.Done():
 			return
 		case cfg := <-config:
-			listenCfg := ListenCfg{}
-			if err := json.Unmarshal([]byte(cfg), &listenCfg); err != nil {
-				l.log.Error("unable to unmarshal", slog.Any("err", err))
+			if cfg.Id == 0 && cfg.AdvertIntv == 0 {
+				l.log.Error("incomplete cfg", slog.Any("cfg", cfg))
 				continue
 			}
 			l.log.Info("cfg", "cfg", cfg)
 
-			if l.listenCfg == nil {
-				if err := l.startListener(&listenCfg, out); err != nil {
+			if l.listenAddr == nil {
+				if err := l.startListener(&cfg, out); err != nil {
 					l.log.Error("unable to start listener", slog.Any("err", err))
 				}
 				continue
 			}
 
-			if listenCfg == *l.listenCfg {
+			if cfg.ListenAddr == *l.listenAddr {
 				continue
 			}
 
 			l.stopListener()
-			l.startListener(&listenCfg, out)
+			l.startListener(&cfg, out)
 		}
 	}
 
@@ -75,17 +66,17 @@ func (l *Listener) UpdateFunc() m.UpdateFunc[state.State] {
 	return func(data any, state *state.State) error {
 		pkt, ok := data.(pt.PacketRx)
 		if !ok {
-			return errors.New("invalide data")
+			return errors.New("invalid data")
 		}
 
 		src, _ := netip.ParseAddrPort(pkt.Src)
-		state.PacketRecv[src] = pkt
+		state.PacketRecvMap[src] = pkt
 		return nil
 	}
 }
 
-func (l *Listener) startListener(listenCfg *ListenCfg, outChan chan<- m.Event) error {
-	laddr := &net.UDPAddr{IP: listenCfg.ListenAddr.IP.AsSlice(), Port: listenCfg.ListenAddr.Port}
+func (l *Listener) startListener(cfg *state.Config, outChan chan<- m.Event) error {
+	laddr := &net.UDPAddr{IP: cfg.ListenAddr.IP.AsSlice(), Port: cfg.ListenAddr.Port}
 	ln, err := net.ListenUDP("udp", laddr)
 	if err != nil {
 		l.log.Error("unable to listen udp", slog.Any("laddr", laddr), slog.Any("err", err))
@@ -94,7 +85,7 @@ func (l *Listener) startListener(listenCfg *ListenCfg, outChan chan<- m.Event) e
 
 	l.log.Info("listening udp on", slog.Any("laddr", laddr))
 	l.listener = ln
-	l.listenCfg = listenCfg
+	l.listenAddr = &cfg.ListenAddr
 
 	l.wg.Add(1)
 	go func() {
@@ -110,7 +101,7 @@ func (l *Listener) stopListener() {
 		l.listener.Close()
 		l.wg.Wait()
 		l.listener = nil
-		l.listenCfg = nil
+		l.listenAddr = nil
 	}
 }
 

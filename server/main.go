@@ -10,6 +10,7 @@ import (
 	pt "mux/internal/packet"
 	"mux/internal/utils"
 	"net"
+	"net/netip"
 	"os"
 	"os/signal"
 	"slices"
@@ -199,8 +200,10 @@ func (p *PacketHandler) Send() {
 	srcIP, _ := utils.AddrPortOrDefaults(p.selfIPPort)
 	for dstIP, info := range p.remoteMap {
 		src := &net.UDPAddr{IP: srcIP, Port: info.srcPort}
+
 		destIP, _ := utils.AddrPortOrDefaults(dstIP)
 		dest := &net.UDPAddr{IP: destIP, Port: info.dstPort}
+		dstIP, _ := netip.ParseAddr(destIP.String())
 
 		var packet pt.PacketTx
 		prio := uint16(0)
@@ -240,10 +243,11 @@ func (p *PacketHandler) Send() {
 							PeerNum:    peerNum,
 							PeerRxAgo:  uint16(utils.Min(0xffff, since(peerNumRxTime))),
 						},
-						DstIP: dest.IP.String(),
+						DstIP: dstIP,
 					}
 
 					data := packet.MarshalAndSetTime()
+
 					n, err := conn.WriteToUDP(data, dest)
 					if err != nil {
 						log.Error("unable to write to client", slog.Any("err", err))
@@ -308,7 +312,7 @@ func (p *PacketHandler) run(ctx context.Context) {
 		case sent := <-p.sendChan: // Send to IP2:5000
 			log.Debug("sendChan", slog.Any("packetTx", sent))
 
-			info, ok := p.remoteMap[sent.DstIP]
+			info, ok := p.remoteMap[sent.DstIP.String()]
 			if !ok {
 				log.Warn("packet sent not in remoteMap", slog.Any("dstIP", sent.DstIP))
 				continue
