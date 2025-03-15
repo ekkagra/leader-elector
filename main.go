@@ -39,20 +39,28 @@ func main() {
 	flag.StringVar(&configFile, "configFile", "./config.json", "Config file path")
 	flag.Parse()
 
-	mux := multiplexer.NewMux(log.With("comp", "mux"), configFile, func() *state.State {
-		return &state.State{
-			PacketRecvMap: make(map[netip.AddrPort]packet.PacketRx),
-			PacketSentMap: make(map[netip.Addr]*utils.RingBuffer[packet.PacketTx]),
-		}
-	})
+	mux := multiplexer.NewMux(setupSignalHandler(), log.With("comp", "mux"), configFile,
+		func() *state.State {
+			return &state.State{
+				HAState:       state.BackupState,
+				PacketRecvMap: make(map[netip.Addr]packet.PacketRx),
+				PacketSentMap: make(map[netip.Addr]*utils.RingBuffer[packet.PacketTx]),
+				Config: state.Config{
+					AdvertIntv: 500,
+					EvalIntv:   100,
+				},
+			}
+		})
 
-	mux.AddEventSource(eventsources.NewListener(log.With("evSource", "listener"), "packet-listener"))
+	mux.AddEventSource(eventsources.NewConfigUpdate("config-updater"), false)
 
-	mux.AddEventSource(eventsources.NewPacketSender(log.With("evSoure", "packet-sender"), "packet-sender"))
+	mux.AddEventSource(eventsources.NewListener(log.With("evSource", "listener"), "packet-listener"), false)
+
+	mux.AddEventSource(eventsources.NewPacketSender(log.With("evSoure", "packet-sender"), "packet-sender"), true)
 
 	mux.SetReconciler(reconciler.NewReconciler(log.With("comp", "reconciler")))
 
-	if err := mux.Run(setupSignalHandler()); err != nil {
+	if err := mux.Run(); err != nil {
 		os.Exit(1)
 	}
 }

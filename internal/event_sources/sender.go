@@ -26,7 +26,7 @@ var since = func(t time.Time) int64 {
 
 type PeerInfo struct {
 	cancel context.CancelFunc
-	inChan chan m.Event
+	inChan chan state.SenderNotifyEvent
 }
 
 type PacketSender struct {
@@ -53,7 +53,7 @@ func NewPacketSender(log *slog.Logger, name string) *PacketSender {
 	}
 }
 
-func (p *PacketSender) Start(ctx context.Context, config <-chan state.Config, in <-chan m.Event, out chan<- m.Event) {
+func (p *PacketSender) Start(ctx context.Context, config <-chan state.Config, in <-chan m.EventFromReconcile, out chan<- m.Event) {
 	defer func() {
 		for _, peerInfo := range p.PeerInfoMap {
 			if peerInfo.cancel != nil {
@@ -97,6 +97,29 @@ func (p *PacketSender) Start(ctx context.Context, config <-chan state.Config, in
 				p.log.Info("adding sender for peer", slog.Any("peer", toAdd))
 				p.startSender(ctx, cfg.ListenAddr.IP, &toAdd, out)
 			}
+
+		case inpEv := <-in:
+			p.log.Debug("got notified from reconciler", slog.Any("inpEv", inpEv))
+			notifyEvent, ok := inpEv.Data.(state.SenderNotifyEvent)
+			if !ok {
+				continue
+			}
+
+			switch notifyEvent.EventType {
+			case state.GlobalNotifyEvent:
+				for _, peerInfo := range p.PeerInfoMap {
+					peerInfo.inChan <- notifyEvent
+				}
+
+			case state.PerSenderNotifyEvent:
+				for peer, peerInfo := range p.PeerInfoMap {
+					if peer.Addr.IP != notifyEvent.DstIP {
+						continue
+					}
+					peerInfo.inChan <- notifyEvent
+				}
+			}
+
 		}
 	}
 }
@@ -136,7 +159,7 @@ func (p *PacketSender) startSender(ctx context.Context, selfIP netip.Addr, peer 
 	ctx2, cancel := context.WithCancel(ctx)
 	peerInfo, ok := p.PeerInfoMap[*peer]
 	if !ok {
-		peerInfo = PeerInfo{inChan: make(chan m.Event)}
+		peerInfo = PeerInfo{inChan: make(chan state.SenderNotifyEvent, 32)}
 	}
 	peerInfo.cancel = cancel
 	p.PeerInfoMap[*peer] = peerInfo
@@ -147,13 +170,13 @@ func (p *PacketSender) startSender(ctx context.Context, selfIP netip.Addr, peer 
 	p.wg.Add(1)
 	go func() {
 		defer p.wg.Done()
-		p.run(ctx2, src, dest, out)
+		p.run(ctx2, src, dest, peerInfo.inChan, out)
 	}()
 
 	return nil
 }
 
-func (p *PacketSender) run(ctx context.Context, src, dest *net.UDPAddr, out chan<- m.Event) {
+func (p *PacketSender) run(ctx context.Context, src, dest *net.UDPAddr, in <-chan state.SenderNotifyEvent, out chan<- m.Event) {
 	dstIP, _ := netip.ParseAddr(dest.IP.String())
 
 	var packet pt.PacketTx
@@ -174,7 +197,6 @@ func (p *PacketSender) run(ctx context.Context, src, dest *net.UDPAddr, out chan
 		}
 
 		ticker := time.NewTicker(time.Millisecond * time.Duration(p.advertIntvMs.Load()))
-		// perSenderNotifyChan := utils.Forwarder(context.Background(), info.perSenderNotifyChan)
 
 	loop:
 		for {
@@ -218,15 +240,18 @@ func (p *PacketSender) run(ctx context.Context, src, dest *net.UDPAddr, out chan
 				out <- m.Event{Name: p.EvName, Data: packet}
 				log.Debug("send OK", slog.Int("n", n), slog.Any("packet", packet))
 
-				// case n := <-info.globalSenderNotifyChan:
-				// 	log.Debug("globalSenderNotifyChan rx", slog.Any("event", n.String()))
-				// 	isMaster = n.haState == MasterState || n.haState == MasterRxLowerPriState
-				// 	prio = uint16(n.prio)
+			case n := <-in:
+				switch n.EventType {
+				case state.GlobalNotifyEvent:
+					log.Debug("GlobalNotifyEvent rx", slog.Any("event", n.String()))
+					isMaster = n.HAState == state.MasterState || n.HAState == state.MasterRxLowerPriState
+					prio = uint16(n.Prio)
 
-				// case n := <-perSenderNotifyChan:
-				// 	log.Debug("-- perSenderNotifyChan rx", slog.Any("event", n.String()))
-				// 	peerNum = n.peerNum
-				// 	peerNumRxTime = n.peerNumRxTime
+				case state.PerSenderNotifyEvent:
+					log.Debug("-- PerSenderNotifyEvent rx", slog.Any("event", n.String()))
+					peerNum = n.PeerNum
+					peerNumRxTime = n.PeerNumRxTime
+				}
 			}
 		}
 	}

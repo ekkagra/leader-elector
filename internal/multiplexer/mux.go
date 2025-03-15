@@ -21,7 +21,7 @@ type UpdateFunc[T any] func(data any, state *T) error
 
 type EventSourceInterface[T any] interface {
 	Name() string
-	Start(ctx context.Context, config <-chan state.Config, in <-chan Event, out chan<- Event)
+	Start(ctx context.Context, config <-chan state.Config, in <-chan EventFromReconcile, out chan<- Event)
 	UpdateFunc() UpdateFunc[T]
 }
 
@@ -47,13 +47,19 @@ type Event struct {
 	Err  error
 }
 
+type EventFromReconcile struct {
+	Event
+}
+
 type EventSourceInfo[T any] struct {
 	src        EventSourceInterface[T]
 	updateFunc UpdateFunc[T]
-	inChan     chan Event
+	inChan     chan EventFromReconcile
+	fwChan     <-chan EventFromReconcile
 }
 
 type Mux[T any] struct {
+	ctx             context.Context
 	configFile      string
 	state           *T
 	log             *slog.Logger
@@ -66,11 +72,12 @@ type Mux[T any] struct {
 	timedRequeuer   *requeuer[T]
 }
 
-func NewMux[T any](log *slog.Logger, configFile string, stateInitializer func() *T) *Mux[T] {
+func NewMux[T any](ctx context.Context, log *slog.Logger, configFile string, stateInitializer func() *T) *Mux[T] {
 	brq := newRequeuer[T]("requeue", time.Second)
 	trq := newRequeuer[T]("requeue-after", time.Second)
 
 	m := &Mux[T]{
+		ctx:             ctx,
 		configFile:      configFile,
 		state:           stateInitializer(),
 		log:             log,
@@ -81,21 +88,21 @@ func NewMux[T any](log *slog.Logger, configFile string, stateInitializer func() 
 		timedRequeuer:   trq,
 	}
 
-	m.AddEventSource(brq)
-	m.AddEventSource(trq)
+	m.AddEventSource(brq, false)
+	m.AddEventSource(trq, false)
 	return m
 }
 
-func (m *Mux[T]) startEventSource(ctx context.Context, inChan chan Event, source EventSourceInterface[T]) {
+func (m *Mux[T]) startEventSource(ctx context.Context, sourceInfo EventSourceInfo[T]) {
 	m.wg.Add(1)
-	configChan := m.fanout.Add(source.Name())
+	configChan := m.fanout.Add(sourceInfo.src.Name())
 	go func() {
 		defer func() {
-			m.fanout.Delete(source.Name())
+			m.fanout.Delete(sourceInfo.src.Name())
 			m.wg.Done()
 		}()
-		source.Start(ctx, configChan, inChan, m.muxChan)
-		m.muxChan <- Event{Name: source.Name(), Err: ErrEventSourceFinished}
+		sourceInfo.src.Start(ctx, configChan, sourceInfo.fwChan, m.muxChan)
+		m.muxChan <- Event{Name: sourceInfo.src.Name(), Err: ErrEventSourceFinished}
 	}()
 }
 
@@ -106,7 +113,22 @@ func (m *Mux[T]) waitForAll() {
 	}()
 }
 
-func (m *Mux[T]) AddEventSource(src EventSourceInterface[T]) error {
+func (m *Mux[T]) sendEventToEventSource(evSrcName string, data EventFromReconcile) {
+	evInfo, ok := m.eventSourceInfo[evSrcName]
+	if !ok {
+		m.log.Warn("attempt to send data to unknown eventSource", slog.String("evSrcName", evSrcName))
+		return
+	}
+
+	if evInfo.inChan != nil {
+		m.log.Debug("sending notify to event source", slog.String("evSrcName", evSrcName), slog.Any("data", data))
+		evInfo.inChan <- data
+	} else {
+		m.log.Warn("event source doesn't accept inputs from reconciler", slog.String("evSrcName", evSrcName))
+	}
+}
+
+func (m *Mux[T]) AddEventSource(src EventSourceInterface[T], requiresInput bool) error {
 	if src.Name() == "" {
 		return fmt.Errorf("event source cannot be empty")
 	}
@@ -115,10 +137,20 @@ func (m *Mux[T]) AddEventSource(src EventSourceInterface[T]) error {
 		return fmt.Errorf("cannot add event source again: %s", src.Name())
 	}
 
+	var (
+		inChan chan EventFromReconcile
+		fwChan <-chan EventFromReconcile
+	)
+	if requiresInput {
+		inChan = make(chan EventFromReconcile)
+		fwChan = utils.Forwarder(m.ctx, utils.ReadChan(inChan))
+	}
+
 	m.eventSourceInfo[src.Name()] = EventSourceInfo[T]{
 		src:        src,
 		updateFunc: src.UpdateFunc(),
-		inChan:     make(chan Event, 16),
+		inChan:     inChan,
+		fwChan:     fwChan,
 	}
 	return nil
 }
@@ -127,11 +159,11 @@ func (m *Mux[T]) SetReconciler(r ReconcilerInterface[T]) {
 	m.reconciler = r
 }
 
-func (m *Mux[T]) Run(ctx context.Context) error {
+func (m *Mux[T]) Run() error {
 	m.log.Info("Starting mux")
 
 	fileOps := []fsnotify.Op{fsnotify.Create, fsnotify.Rename}
-	configChan, err := utils.FileWatcher(ctx, m.configFile, fileOps, func(ev fsnotify.Event) state.Config {
+	configChan, err := utils.FileWatcher(m.ctx, m.configFile, fileOps, func(ev fsnotify.Event) state.Config {
 		cont, err := os.ReadFile(ev.Name)
 		if err != nil {
 			return state.Config{}
@@ -148,17 +180,17 @@ func (m *Mux[T]) Run(ctx context.Context) error {
 		return err
 	}
 
-	m.fanout = utils.NewFanOut(ctx, configChan)
+	m.fanout = utils.NewFanOut(m.ctx, configChan)
 	m.fanout.Run()
 
 	for _, evSource := range m.eventSourceInfo {
-		m.startEventSource(ctx, evSource.inChan, evSource.src)
+		m.startEventSource(m.ctx, evSource)
 	}
 
 	m.waitForAll()
 
 	for ev := range m.muxChan {
-		m.log.Info("event received", ev.Name, ev.Data)
+		m.log.Debug("event received", ev.Name, ev.Data)
 
 		m.backoffRequeuer.ticker.Stop()
 		if ev.Name == "requeue-after" {
@@ -181,7 +213,7 @@ func (m *Mux[T]) Run(ctx context.Context) error {
 			continue
 		}
 
-		res, err := m.reconciler.Reconcile(ctx, ev.Name, m.state)
+		res, err := m.reconciler.Reconcile(m.ctx, ev.Name, m.state, m.sendEventToEventSource)
 		if err != nil {
 			m.log.Error("error on reconciling", slog.String("event", ev.Name), slog.Any("error", err))
 			res.Requeue = true
@@ -199,39 +231,11 @@ func (m *Mux[T]) Run(ctx context.Context) error {
 	return nil
 }
 
-// ------------------------------------
-// Requeuer
-type requeuer[T any] struct {
-	NilUpdateEventSource[T]
-	ticker *time.Ticker
-}
-
-func newRequeuer[T any](name string, duration time.Duration) *requeuer[T] {
-	t := time.NewTicker(duration)
-	t.Stop()
-
-	return &requeuer[T]{
-		NilUpdateEventSource: NilUpdateEventSource[T]{Named{name}},
-		ticker:               t,
-	}
-}
-
-func (r *requeuer[T]) Start(ctx context.Context, _ <-chan state.Config, _ <-chan Event, out chan<- Event) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-r.ticker.C:
-			out <- Event{Name: r.EvName}
-		}
-	}
-}
-
 type Result struct {
 	Requeue      bool
 	RequeueAfter time.Duration
 }
 
 type ReconcilerInterface[T any] interface {
-	Reconcile(ctx context.Context, eventName string, state *T) (Result, error)
+	Reconcile(ctx context.Context, eventName string, state *T, notifyEventSource func(string, EventFromReconcile)) (Result, error)
 }

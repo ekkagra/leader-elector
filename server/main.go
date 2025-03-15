@@ -172,7 +172,7 @@ func (p *PacketHandler) Listen() {
 		}
 		log.Debug("rx data", slog.Any("remote", remote.String()), slog.Any("data", string(data[:n])))
 
-		packet := pt.PacketRx{Src: remote.AddrPort().String()}
+		packet := pt.PacketRx{Src: remote.AddrPort().Addr()}
 		if err := packet.UnmarshalWithTime(data[:n]); err != nil {
 			log.Error("unable to unmarshal packet", slog.Any("err", err))
 			continue
@@ -328,12 +328,12 @@ func (p *PacketHandler) run(ctx context.Context) {
 			//    PacketRx.SelfNum which becomes PacketTx.LastPeerNum
 			//    PacketRx.RecvTime so that it calculates PacketTx.PeerRxAgo
 			found := false
-			recvIP, _ := utils.AddrPortOrDefaults(recv.Src)
+			recvIP := net.ParseIP(recv.Src.String())
 			for dstIP, info := range p.remoteMap {
 				ip, _ := utils.AddrPortOrDefaults(dstIP)
 				if recvIP.Equal(ip) {
 					found = true
-					log.Debug("sending notification to specific sender", slog.String("sender", recv.Src),
+					log.Debug("sending notification to specific sender", slog.String("sender", recv.Src.String()),
 						slog.Any("peerNum", recv.PeerNum), slog.Any("peerRxTime", recv.RecvTime))
 					info.perSenderNotifyChan <- SenderNotifyEvent{peerNum: recv.SelfNum, peerNumRxTime: recv.RecvTime}
 
@@ -359,7 +359,7 @@ func (p *PacketHandler) run(ctx context.Context) {
 				}
 			}
 			if !found {
-				log.Warn("recv addr not found in remoteMap", slog.String("recv Src", recv.Src))
+				log.Warn("recv addr not found in remoteMap", slog.String("recv Src", recv.Src.String()))
 				continue
 			}
 			// case checkScripts, fileChecks, netlinkChecks:

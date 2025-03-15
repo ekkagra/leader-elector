@@ -48,12 +48,11 @@ func (f *FileEventSource) Start(ctx context.Context, configChan <-chan string, o
 
 func (f *FileEventSource) UpdateFunc() UpdateFunc[state.State] {
 	return func(data any, state *state.State) error {
-		val, ok := data.(int)
+		_, ok := data.(int)
 		if !ok {
 			return fmt.Errorf("unable to cast to int")
 		}
 
-		state.FileState = val
 		return nil
 	}
 }

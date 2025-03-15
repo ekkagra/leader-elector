@@ -8,7 +8,6 @@ import (
 	pt "mux/internal/packet"
 	"mux/internal/state"
 	"net"
-	"net/netip"
 	"sync"
 )
 
@@ -30,7 +29,7 @@ func NewListener(log *slog.Logger, name string) *Listener {
 	}
 }
 
-func (l *Listener) Start(ctx context.Context, config <-chan state.Config, _ <-chan m.Event, out chan<- m.Event) {
+func (l *Listener) Start(ctx context.Context, config <-chan state.Config, _ <-chan m.EventFromReconcile, out chan<- m.Event) {
 	defer l.stopListener()
 
 	for {
@@ -69,8 +68,7 @@ func (l *Listener) UpdateFunc() m.UpdateFunc[state.State] {
 			return errors.New("invalid data")
 		}
 
-		src, _ := netip.ParseAddrPort(pkt.Src)
-		state.PacketRecvMap[src] = pkt
+		state.PacketRecvMap[pkt.Src] = pkt
 		return nil
 	}
 }
@@ -115,7 +113,7 @@ func (l *Listener) readForever(outChan chan<- m.Event) {
 		}
 		l.log.Debug("rx data", slog.Any("remote", remote.String()), slog.Any("data", string(data[:n])))
 
-		packet := pt.PacketRx{Src: remote.AddrPort().String()}
+		packet := pt.PacketRx{Src: remote.AddrPort().Addr()}
 		if err := packet.UnmarshalWithTime(data[:n]); err != nil {
 			l.log.Error("unable to unmarshal packet", slog.Any("err", err))
 			continue

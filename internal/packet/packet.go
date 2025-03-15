@@ -81,7 +81,7 @@ func (p *Packet) Marshal() []byte {
 type PacketRx struct {
 	Packet
 	RecvTime   time.Time
-	Src        string
+	Src        netip.Addr
 	Reconciled bool
 }
 

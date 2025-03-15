@@ -166,3 +166,7 @@ func (f *FanOut[T]) Run() {
 	}()
 	<-started
 }
+
+func ReadChan[T any](inp chan T) <-chan T {
+	return inp
+}
